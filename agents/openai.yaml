@@ -1,0 +1,4 @@
+interface:
+  display_name: "蓝胖子"
+  short_description: "批量生成喜马拉雅分镜与商品海报提示词 Excel"
+  default_prompt: "使用 $multi-scene-image-prompt 把我提供的内容转换为固定模板的 AI 图片提示词 Excel。"
