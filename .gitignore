@@ -1,0 +1,212 @@
+.DS_Store
+node_modules
+outputs/
+*.png
+__pycache__/
+*** Add File: scripts/validate_workbook.py
+#!/usr/bin/env python3
+"""Validate 蓝胖子 output workbooks using only the Python standard library."""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+import zipfile
+from collections import Counter, defaultdict
+from pathlib import Path, PurePosixPath
+from xml.etree import ElementTree as ET
+
+MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+HEADERS = {
+    "专辑汇总": ["专辑ID", "专辑名称", "视频生成数量", "单条视频图片数量", "最终图片总量", "专辑统一风格"],
+    "图片提示词明细": ["专辑ID", "专辑名称", "视频编号", "图片编号", "建议时长(秒)", "图片提示词"],
+    "Sheet1任务汇总": ["任务ID", "任务名称", "任务模式", "生成数量", "海报总数", "统一风格说明"],
+    "Sheet2商品海报提示词明细": ["任务ID", "任务名称", "海报编号", "是否带文字", "图片比例", "图片提示词"],
+}
+
+
+def column_index(reference: str) -> int:
+    letters = re.match(r"[A-Z]+", reference)
+    if not letters:
+        return 0
+    value = 0
+    for char in letters.group(0):
+        value = value * 26 + ord(char) - 64
+    return value - 1
+
+
+def as_int(value: str, label: str, errors: list[str]) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        errors.append(f"{label} 应为整数，实际为 {value!r}")
+        return 0
+
+
+def load_workbook(path: Path) -> dict[str, list[list[str]]]:
+    with zipfile.ZipFile(path) as archive:
+        shared: list[str] = []
+        if "xl/sharedStrings.xml" in archive.namelist():
+            root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+            for item in root.findall(f"{{{MAIN_NS}}}si"):
+                shared.append("".join(node.text or "" for node in item.iter(f"{{{MAIN_NS}}}t")))
+
+        workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+        relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        targets = {
+            rel.attrib["Id"]: rel.attrib["Target"]
+            for rel in relationships.findall(f"{{{PKG_REL_NS}}}Relationship")
+        }
+
+        result: dict[str, list[list[str]]] = {}
+        for sheet in workbook.find(f"{{{MAIN_NS}}}sheets") or []:
+            name = sheet.attrib["name"]
+            target = targets[sheet.attrib[f"{{{REL_NS}}}id"]].lstrip("/")
+            if not target.startswith("xl/"):
+                target = str(PurePosixPath("xl") / target)
+            target = str(PurePosixPath(target))
+            root = ET.fromstring(archive.read(target))
+            rows: list[list[str]] = []
+            for row in root.findall(f".//{{{MAIN_NS}}}row"):
+                values: dict[int, str] = {}
+                for cell in row.findall(f"{{{MAIN_NS}}}c"):
+                    index = column_index(cell.attrib.get("r", "A1"))
+                    kind = cell.attrib.get("t")
+                    if kind == "inlineStr":
+                        value = "".join(node.text or "" for node in cell.iter(f"{{{MAIN_NS}}}t"))
+                    else:
+                        node = cell.find(f"{{{MAIN_NS}}}v")
+                        raw = node.text if node is not None and node.text is not None else ""
+                        if kind == "s" and raw:
+                            value = shared[int(raw)]
+                        elif kind == "b":
+                            value = "TRUE" if raw == "1" else "FALSE"
+                        else:
+                            value = raw
+                    values[index] = value
+                width = max(values, default=-1) + 1
+                rows.append([values.get(i, "") for i in range(width)])
+            result[name] = rows
+        return result
+
+
+def padded_number(value: str) -> bool:
+    return bool(re.fullmatch(r"\d{2,}", value))
+
+
+def validate(path: Path) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    try:
+        sheets = load_workbook(path)
+    except (OSError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
+        return [f"无法读取有效的 .xlsx 文件：{exc}"], []
+
+    known = set(sheets) & set(HEADERS)
+    if not known:
+        errors.append("未找到任何蓝胖子固定输出 Sheet")
+        return errors, warnings
+
+    pairs = [("专辑汇总", "图片提示词明细"), ("Sheet1任务汇总", "Sheet2商品海报提示词明细")]
+    for left, right in pairs:
+        if (left in sheets) != (right in sheets):
+            errors.append(f"{left} 与 {right} 必须成对出现")
+
+    extras = set(sheets) - set(HEADERS)
+    if extras:
+        errors.append(f"存在不允许的额外 Sheet：{', '.join(sorted(extras))}")
+
+    for name in known:
+        rows = sheets[name]
+        actual = (rows[0] + [""] * len(HEADERS[name]))[: len(HEADERS[name])] if rows else []
+        if actual != HEADERS[name]:
+            errors.append(f"{name} 表头错误：应为 {HEADERS[name]}，实际为 {actual}")
+
+    if {"专辑汇总", "图片提示词明细"} <= set(sheets):
+        summary = [row + [""] * 6 for row in sheets["专辑汇总"][1:] if any(row)]
+        detail = [row + [""] * 6 for row in sheets["图片提示词明细"][1:] if any(row)]
+        grouped: Counter[tuple[str, str]] = Counter((row[0], row[1]) for row in detail)
+        per_video: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
+        for line, row in enumerate(detail, start=2):
+            key = (row[0], row[1])
+            per_video[key][row[2]] += 1
+            if not padded_number(row[2]) or not padded_number(row[3]):
+                errors.append(f"图片提示词明细第 {line} 行的视频编号和图片编号必须是至少两位数字文本")
+            try:
+                duration = float(row[4])
+                if not 5 <= duration <= 8:
+                    warnings.append(f"图片提示词明细第 {line} 行建议时长不在 5–8 秒内")
+            except ValueError:
+                errors.append(f"图片提示词明细第 {line} 行建议时长无效")
+            if not row[5].strip():
+                errors.append(f"图片提示词明细第 {line} 行提示词为空")
+            if re.search(r"同上|保持上一张|与前图一致|延续上一场|相同风格继续", row[5]):
+                errors.append(f"图片提示词明细第 {line} 行使用了非独立提示词表达")
+
+        for line, row in enumerate(summary, start=2):
+            key = (row[0], row[1])
+            videos = as_int(row[2], f"专辑汇总第 {line} 行视频生成数量", errors)
+            images = as_int(row[3], f"专辑汇总第 {line} 行单条视频图片数量", errors)
+            total = as_int(row[4], f"专辑汇总第 {line} 行最终图片总量", errors)
+            if total != videos * images:
+                errors.append(f"专辑汇总第 {line} 行最终图片总量不等于视频数 × 单条图片数")
+            if grouped[key] != total:
+                errors.append(f"专辑 {row[0]!r} 明细实际 {grouped[key]} 行，与汇总 {total} 不一致")
+            if any(count != images for count in per_video[key].values()) or len(per_video[key]) != videos:
+                errors.append(f"专辑 {row[0]!r} 的视频数或每条视频图片数与汇总不一致")
+
+    if {"Sheet1任务汇总", "Sheet2商品海报提示词明细"} <= set(sheets):
+        summary = [row + [""] * 6 for row in sheets["Sheet1任务汇总"][1:] if any(row)]
+        detail = [row + [""] * 6 for row in sheets["Sheet2商品海报提示词明细"][1:] if any(row)]
+        grouped: Counter[tuple[str, str]] = Counter((row[0], row[1]) for row in detail)
+        for line, row in enumerate(detail, start=2):
+            if not padded_number(row[2]):
+                errors.append(f"商品海报明细第 {line} 行海报编号必须是至少两位数字文本")
+            if row[3] not in {"是", "否"}:
+                errors.append(f"商品海报明细第 {line} 行是否带文字只能是“是”或“否”")
+            if row[4] not in {"9:16", "4:5", "1:1", "16:9"}:
+                errors.append(f"商品海报明细第 {line} 行图片比例无效：{row[4]!r}")
+            if not row[5].strip():
+                errors.append(f"商品海报明细第 {line} 行提示词为空")
+            if row[3] == "否" and "不得出现任何文字" not in row[5]:
+                warnings.append(f"商品海报明细第 {line} 行未明确写入无文字约束")
+            if row[3] == "是" and "严格逐字" not in row[5]:
+                warnings.append(f"商品海报明细第 {line} 行未明确写入文案逐字准确约束")
+
+        for line, row in enumerate(summary, start=2):
+            key = (row[0], row[1])
+            count = as_int(row[3], f"任务汇总第 {line} 行生成数量", errors)
+            total = as_int(row[4], f"任务汇总第 {line} 行海报总数", errors)
+            if row[2] != "商品海报":
+                errors.append(f"任务汇总第 {line} 行任务模式必须是“商品海报”")
+            if total != count:
+                errors.append(f"任务汇总第 {line} 行海报总数必须等于生成数量")
+            if grouped[key] != total:
+                errors.append(f"任务 {row[0]!r} 明细实际 {grouped[key]} 行，与汇总 {total} 不一致")
+
+    return errors, warnings
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="校验蓝胖子生成的 Excel 固定结构")
+    parser.add_argument("workbook", type=Path, help="待校验的 .xlsx 文件")
+    args = parser.parse_args()
+
+    errors, warnings = validate(args.workbook)
+    for message in warnings:
+        print(f"WARNING: {message}")
+    for message in errors:
+        print(f"ERROR: {message}")
+    if errors:
+        print(f"FAIL: {len(errors)} 个错误，{len(warnings)} 个警告")
+        return 1
+    print(f"PASS: 结构校验通过，{len(warnings)} 个警告")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
