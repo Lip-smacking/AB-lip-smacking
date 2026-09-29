@@ -1,10 +1,15 @@
 ---
 name: dynamic-prompt-planner
 description: Diagnose a user's goal and co-create a concise, structured AI prompt using an appropriate ICIO module combination. Use when users want to clarify, design, rewrite, or optimize prompts for commercial, creative, technical, analytical, or complex tasks. Do not use when the user wants the underlying task completed directly rather than a reusable prompt.
+display_name: 蓝胖子
+description_zh: 将模糊需求整理成精简、可直接复用的 AI 提示词。
+description_en: Turn a vague goal into a concise, reusable AI prompt.
+version: "3.0.1"
+author: Haiyannnn
 license: MIT
 metadata:
   author: Haiyannnn
-  version: "3.0.0"
+  version: "3.0.1"
   language: zh-CN
 ---
 
